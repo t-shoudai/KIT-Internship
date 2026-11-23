@@ -1,0 +1,965 @@
+\documentclass[11pt,a4paper]{jsarticle}
+
+\usepackage[margin=.8in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{mathtools}
+\mathtoolsset{showonlyrefs=true}
+\usepackage{ascmac}
+\usepackage{fancybox}
+\usepackage{cases}
+\usepackage{array,arydshln}
+\usepackage{color}
+\usepackage{framed}
+\definecolor{shadecolor}{gray}{0.85}
+\usepackage{url}
+\usepackage{bm}
+\usepackage{fancyhdr}
+\usepackage[dvipdfmx]{graphicx}
+\usepackage{multirow}
+
+\renewcommand{\thepart}{\arabic{part}}
+\pagestyle{fancy}
+    \lhead{グラフニューラルネットワーク実習}
+    \chead{}
+    \rhead{九州工業大学大学院 インターンシップ}
+    \lfoot{福岡工業大学}
+    \cfoot{\thepage}
+    \rfoot{2026-11-20〜11-27}
+
+\title{グラフニューラルネットワーク実習}
+\author{九州工業大学大学院 インターンシップ}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本実習では、グラフニューラルネットワーク(GNN)を題材として、
+機械学習モデルの内部で行われている計算を自分の手で再現し、
+その振る舞いを実験的に確かめる方法を学ぶ。
+第1部前半では、グラフ畳み込みという演算をNumPyだけで手計算し、
+それがライブラリの出力と数値まで一致することを確認したうえで、
+集約のしかたを自分で書き換えたレイヤを実装し、その違いが分類精度にどう影響するかを測定する。
+第1部後半では、そこから自然に導かれる「層を深くすれば精度が上がる」という予想を実測で検証し、
+結果が予想を裏切る原因を、汎化の失敗と最適化の失敗に切り分ける。
+さらにグラフ分類に移り、「その精度は本当にGNNがグラフ構造を理解した結果なのか」を
+ベースラインとの比較によって検証する。
+あわせて、乱数に左右される実験結果を正しく比較するための作法を身につける。
+\end{abstract}
+\thispagestyle{fancy}
+
+\section{はじめに}
+
+画像や文章と違い、ソーシャルネットワーク、分子構造、論文の引用関係といったデータは
+\textbf{グラフ}(頂点と辺の集まり)として表される。
+こうした不規則な構造を持つデータを扱う深層学習の手法が
+\textbf{グラフニューラルネットワーク(GNN)}である。
+
+GNNの実装にはPyTorch Geometric (PyG)というライブラリが広く使われており、
+\verb|GCNConv(...)| と一行書くだけでグラフ畳み込み層が作れる。
+しかしそれでは、中で何が計算されているのかを知らないまま実験が終わってしまう。
+「精度が上がりました」「下がりました」という報告はできても、
+\textbf{なぜそうなったのか}を説明できない。
+
+そこで本実習では、次の順序で進める。
+
+\begin{enumerate}
+\item グラフ畳み込みをNumPyだけで手計算し、\verb|GCNConv| と一致することを確かめる(第1部前半)
+\item 集約のしかたを自分で書き換えたレイヤを実装し、違いを測定する(第1部後半)
+\item 層を深くしたときに何が起きるかを実測し、その原因を切り分ける(第2部前半)
+\item グラフ分類において、GNNが単純な手法を本当に上回るのかを検証する(第2部後半)
+\end{enumerate}
+
+本実習では、\textbf{数値を並べるだけで終わらせない}。
+得られた数値が「なぜそうなったのか」を、畳み込みと集約の仕組みに帰着して説明できることを目指す。
+
+\section{実習の準備}
+
+\subsection*{(A) Python仮想環境の構築}
+
+本実習ではプログラミング言語Python、プログラミング環境Jupyter Notebookを用いる。
+参加者ごとのプログラミング環境を維持するために、仮想環境を作成する。まず、
+
+\begin{center}
+[スタート]メニュー $\Longrightarrow$ [すべてのアプリ] $\Longrightarrow$ [Anaconda3 (64bit)] $\Longrightarrow$ [Anaconda Prompt (anaconda3)]
+\end{center}
+
+\noindent
+の順でクリックして、Anacondaのbase環境が始動したコマンドプロンプトを開く。
+そして、次のように仮想環境を作成する。
+\verb|仮想環境名| は、担当教員から指示された文字列に置き換えること。
+
+\begin{screen}
+\begin{small}
+\begin{verbatim}
+(base) C:\Users\Student>conda create --name 仮想環境名 python=3.11 -y
+(base) C:\Users\Student>conda activate 仮想環境名
+(仮想環境名) C:\Users\Student>conda install jupyter -y
+\end{verbatim}
+\end{small}
+\end{screen}
+
+\subsection*{(B) ライブラリのインストール}
+
+続いて、本実習で用いるライブラリをインストールする。
+PyTorchは\textbf{CPU版}を用いる。
+
+PCにGPUが搭載されていても、本実習ではGPUを使わない。
+理由は2つある。
+第一に、本実習で扱うモデルとデータは小さく、
+GPUに処理を渡す手間のほうが計算そのものより大きくなるため、
+GPUを使っても速くならない(むしろ遅くなることがある)。
+第二に、GPU版はインストール容量がCPU版の10倍以上あり、
+参加者ごとに仮想環境を作る本実習には向かない。
+
+同じ理由で、配布するノートブックは計算スレッドを1に固定している。
+小さなモデルではスレッドを増やすとかえって遅くなる。
+
+\begin{screen}
+\begin{small}
+\begin{verbatim}
+(仮想環境名) C:\Users\Student>pip install torch --index-url
+                                   https://download.pytorch.org/whl/cpu
+(仮想環境名) C:\Users\Student>pip install torch_geometric
+(仮想環境名) C:\Users\Student>pip install numpy scipy matplotlib scikit-learn
+\end{verbatim}
+\end{small}
+\end{screen}
+
+\noindent
+※1行目は紙面の都合で折り返しているが、実際には\textbf{1行で}入力すること。
+
+\subsection*{(C) データの配置と実験開始}
+
+配布されたノートブックとデータセットを、担当教員の指示に従って配置する。
+ノートブックからは \verb|../data| の位置にデータセットがあるものとして参照する。
+
+\begin{screen}
+\begin{small}
+\begin{verbatim}
+(仮想環境名) C:\Users\Student>cd 仮想環境名
+(仮想環境名) C:\Users\Student>jupyter notebook
+\end{verbatim}
+\end{small}
+\end{screen}
+
+\noindent
+ブラウザが開いたら、配布された \verb|gnn_1a.ipynb| を開いて実験を開始する。
+
+\part{グラフ畳み込みの仕組みを理解する}
+
+\section{グラフ畳み込みを手で計算する (前半)}
+
+使用するノートブック: \verb|gnn_1a.ipynb|
+
+\subsection{題材 --- Zacharyの空手クラブ}
+
+ある大学の空手クラブの34人の人間関係を表したグラフを用いる。
+辺は「クラブの外でも交流があった」ことを表す。
+34頂点と小さいので、行列を目で見て確かめられる。
+
+各頂点には、このグラフをGirvan-Newman法で分割して得られる\textbf{4つのコミュニティ}の
+どれに属するかがラベルとして与えられている。
+空手クラブは実際には2つに分裂したことで有名だが、
+PyTorch Geometricが同梱しているラベルは分裂後の2派閥ではなく4コミュニティである。混同しないこと。
+
+頂点の特徴量 \verb|data.x| は $34\times34$ の\textbf{単位行列}である。
+つまり「頂点$i$の特徴ベクトルは$i$番目の成分だけが1」という、頂点を区別するためだけの特徴量である。
+これは第\ref{sec:onehop}節で効いてくる。
+
+\subsection{隣接行列}
+
+PyGはグラフを \verb|edge_index| という$2\times(\mbox{辺数})$の行列で保持している。
+1行目が辺の始点、2行目が終点である。
+無向グラフなので、辺$\{u,v\}$は$(u\to v)$と$(v\to u)$の2本として格納されている。
+
+ここから隣接行列$A$を作る。$A_{ij}=1$は「頂点$i$と$j$が隣接する」ことを表す。
+
+\begin{screen}
+\textbf{課題1a-1} \quad ノートブックの該当セルを埋めて、隣接行列 \verb|A| を完成させよ。
+\end{screen}
+
+\noindent
+作成後、次の性質が成り立つことを検算セルで確認すること。
+
+\begin{itemize}
+\item $A$は対称行列である(無向グラフだから)
+\item $A$の成分は0か1のみである
+\item $A$の対角成分はすべて0である(自己ループはまだ無い)
+\end{itemize}
+
+\subsection{対称正規化}
+
+グラフ畳み込みは「自分と隣人の特徴を混ぜる」演算である。
+ただし素朴に足し合わせると、\textbf{次数の大きい頂点ほど値が大きくなってしまう}。
+この弊害は第\ref{sec:degbias}節で実測する。そこで次の2段階を踏む。
+
+\medskip
+\noindent
+\textbf{(a) 自己ループを足す}\quad 混合のときに自分自身の特徴も残すため
+\begin{equation}
+\tilde{A} = A + I
+\end{equation}
+
+\noindent
+\textbf{(b) 対称正規化する}\quad 次数による大小を打ち消すため
+\begin{equation}
+\hat{A} = \tilde{D}^{-1/2}\,\tilde{A}\,\tilde{D}^{-1/2},
+\qquad \tilde{D}_{ii}=\sum_{j}\tilde{A}_{ij}
+\end{equation}
+
+\noindent
+成分で書くと、頂点$i,j$が隣接するとき
+\begin{equation}
+\hat{A}_{ij}=\frac{1}{\sqrt{\tilde{d}_i}\sqrt{\tilde{d}_j}}
+\end{equation}
+である。\textbf{両端の次数が大きい辺ほど重みが小さくなる}ことを式から読み取ってほしい。
+
+\begin{screen}
+\textbf{課題1a-2} \quad ノートブックの該当セルを埋めて、$\hat{A}$を完成させよ。
+\end{screen}
+
+\noindent
+検算セルでは、辺ごとに「両端の次数の積」と「$\hat{A}$の重み」を対応させた表が表示される。
+重みが$1/\sqrt{\tilde{d}_i\tilde{d}_j}$と完全に一致すること、
+および次数の積と重みの相関係数が負になることを確認せよ。
+
+\medskip
+\noindent
+※ここで\textbf{頂点単位の平均ではなく辺単位で見る}必要がある。
+辺の重みは両端の次数で決まるため、
+「次数の大きい頂点の隣接辺の平均重み」を見ても単調な関係は現れない。
+
+\subsection{畳み込み1層を手で計算する}
+
+グラフ畳み込み層 \verb|GCNConv| が行う計算は、実は次の一行に尽きる。
+
+\begin{equation}\label{eq:gcn}
+H' = \hat{A}\,X\,W^{\top} + b
+\end{equation}
+
+\noindent
+ここで$X$は入力の特徴行列(頂点数$\times$入力次元)、
+$W$は重み行列(出力次元$\times$入力次元)、$b$はバイアスである。
+$W$に転置が付くのはPyTorchの \verb|Linear| の流儀による。
+
+$\hat{A}$を左から掛けることが「隣人と混ぜる」、
+$W^{\top}$を右から掛けることが「特徴を変換する」に対応している。\textbf{これだけ}である。
+
+\begin{screen}
+\textbf{課題1a-3} \quad ノートブックの該当セルを埋めて式\eqref{eq:gcn}を手で計算し、
+同じ重みを載せた \verb|GCNConv| の出力と一致することを確認せよ。
+\end{screen}
+
+\noindent
+最大絶対誤差が $10^{-5}$ 未満であれば一致とみなす。
+一致しない場合は、$\hat{A}$の作り方か行列積の順序を見直すこと。
+
+\subsection{1層は1ホップ}\label{sec:onehop}
+
+畳み込みを1回行うと、各頂点の新しい特徴は\textbf{自分と隣接頂点}の情報だけから作られる。
+2回行えば\textbf{2ホップ先}まで届く。これがGNNの層数の意味である。
+
+ここで特徴量$X$が単位行列であることが効いてくる。
+$X=I$ なら $\hat{A}XW^{\top}=\hat{A}W^{\top}$ となり、
+\textbf{頂点$i$の出力がどの頂点の入力に依存するかは、$\hat{A}$の第$i$行の非ゼロ位置そのもの}になる。
+
+\begin{screen}
+\textbf{課題1a-4} \quad 頂点0の1層出力が依存する頂点の集合を求め、
+それが「頂点0の隣接頂点$\cup\{$頂点0自身$\}$」と一致することを確かめよ。
+\end{screen}
+
+\noindent
+続くセルでは、層数を1から6まで変えたときに
+1つの頂点が参照する範囲がどこまで広がるかが表示される。
+Zacharyのグラフでは3層でグラフ全体に到達する。
+
+ここから「層を深くするほど使える情報が増えて精度が上がるはずだ」と考えたくなる。
+\textbf{この予想が正しいかどうかは第2部前半で実測する。}
+課題1a-5(3)で自分の予想を書いておくこと。
+
+\section{集約のしかたを自分で作り替える (後半)}
+
+使用するノートブック: \verb|gnn_1b.ipynb|
+
+\subsection{メッセージパッシング}
+
+$\hat{A}$を掛ける操作は、言い換えれば
+
+\begin{center}
+\textbf{各頂点が、隣人から特徴ベクトルを受け取り、重みを付けて足し合わせる}
+\end{center}
+
+\noindent
+という操作である。これを\textbf{メッセージパッシング}(message passing)と呼ぶ。
+GNNのレイヤは、ほぼすべてこの枠組みで書ける。違いは次の2点だけである。
+
+\begin{enumerate}
+\item \textbf{どんなメッセージを送るか}(そのまま送る/重みを掛けて送る/相手に応じて変える)
+\item \textbf{受け取ったメッセージをどう集約するか}(和/平均/最大)
+\end{enumerate}
+
+PyGの \verb|MessagePassing| クラスを継承すると、次の3つを書くだけで畳み込み層が作れる。
+
+\begin{center}
+\begin{tabular}{|l|p{10cm}|}
+\hline
+\verb|forward(x, edge_index)| & 前処理をして \verb|propagate()| を呼ぶ \\
+\hline
+\verb|message(x_j, ...)| & \textbf{辺ごとに}「送るメッセージ」を作る。\verb|x_j| は辺の始点の特徴 \\
+\hline
+集約(\verb|aggr| 引数) & 頂点ごとに届いたメッセージをまとめる。\verb|"add"|, \verb|"mean"|, \verb|"max"| \\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent
+式\eqref{eq:gcn}をこの枠組みで書き直すと、頂点$i$の出力は次のようになる。
+
+\begin{equation}
+\bm{x}'_i \;=\; \sum_{j\in\mathcal{N}(i)\cup\{i\}}
+\underbrace{\frac{1}{\sqrt{\tilde{d}_i}\sqrt{\tilde{d}_j}}}_{\mbox{\footnotesize 辺の重み}}
+\cdot\underbrace{W\bm{x}_j}_{\mbox{\footnotesize \texttt{x\_j}}}\;+\;\bm{b}
+\end{equation}
+
+\noindent
+つまり \verb|message()| が「辺の重み$\times$始点の特徴」を返し、
+\verb|aggr="add"| がそれを足し合わせる。
+
+\begin{screen}
+\textbf{課題1b-1} \quad ノートブックの \verb|MyConv.message()| を完成させ、
+\verb|MyConv(aggr="add", normalize=True)| が \verb|GCNConv| と一致することを確認せよ。
+\end{screen}
+
+\subsection{正規化は何をしているのか --- 次数バイアスの測定}\label{sec:degbias}
+
+\verb|normalize=False| にすると辺の重みがすべて1になり、
+メッセージは\textbf{そのまま足し合わされる}。このとき何が起きるか。
+
+隣人が多い頂点ほど、たくさんのメッセージを受け取って値が大きくなるはずである。
+これを\textbf{次数バイアス}と呼ぶことにする。
+
+測り方は次のとおりである。
+各頂点の出力ベクトルの大きさ(ノルム)と、その頂点の次数の\textbf{相関係数}を見る。
+相関が正に大きいほど「次数が大きい頂点ほど出力が大きい」ことを意味する。
+
+\begin{screen}
+\textbf{課題1b-2} \quad ノートブックの該当セルを埋めて、
+集約関数(\verb|add|/\verb|mean|/\verb|max|)と正規化の有無の6通りについて、
+出力ノルムと次数の相関係数を求めよ。
+\end{screen}
+
+\noindent
+得られた表の「次数との相関」の列を比べ、
+どの組み合わせで次数バイアスが強く出ているかを確認すること。
+また \verb|mean| では相関の符号がどうなるかにも注目せよ。
+その理由を集約の式に戻って説明できるようにしておくこと(課題1b-5で問う)。
+
+\subsection{集約の違いは精度に効くのか}
+
+ここまでは1層だけを通した出力を見てきた。
+では、実際に\textbf{学習させたとき}に集約の違いは精度に効くのか。
+
+題材をCoraに変える。これは論文の引用ネットワークで、
+頂点は論文、辺は引用関係、ラベルは論文の分野(7クラス)である。
+頂点数2708、辺数10556、特徴次元1433である。
+
+Coraでは、全2708頂点のうち\textbf{学習に使えるラベルは140頂点分だけ}である。
+残りの頂点の特徴と辺は「見える」が、正解ラベルは使わない。
+このような設定を\textbf{伝導的学習}(transductive learning)と呼ぶ。
+
+\subsection{実験結果の比較のしかた}\label{sec:paired}
+
+\begin{itembox}[l]{本実習で最も重要な作法}
+ニューラルネットワークの学習は重みの初期値(乱数)に依存する。
+\textbf{同じ設定でも実行するたびに精度が変わる。}
+したがって「AのほうがBより精度が高かった」と言うには、
+乱数の種(seed)を変えて複数回実行しなければならない。
+\textbf{1回だけの実行結果で優劣を判断してはならない。}
+\end{itembox}
+
+\noindent
+本実習では、すべての精度をseed 5通りで測定する。
+そして比較には\textbf{対応のある比較}(paired comparison)を用いる。
+
+すべての設定を同じseedの並びで実行しているので、重みの初期値も同じである。
+したがって設定どうしをseedごとに1対1で対応させて差を取ることができる。
+「たまたま良い初期値を引いたから勝った」という可能性を排除できるので、
+平均と標準偏差だけを比べるよりずっと信頼できる。
+
+判定は次の2点で行う。
+
+\begin{enumerate}
+\item \textbf{5回すべてで勝ったか}(全勝なら偶然とは考えにくい)
+\item 差の平均が、差の\textbf{標準誤差} $\mathrm{sd}/\sqrt{n}$ の2倍を超えているか
+\end{enumerate}
+
+\begin{itembox}[l]{ただし言いすぎないこと}
+この2点を満たしても、「一般に優れている」と結論してはいけない。
+言えるのは\textbf{「今回の5通りのseedでは一貫して高かった」}までである。
+
+$n=5$ は統計的な判定を下すには少ない。
+さらに、同じデータセットの同じ分割を使い回しているので、
+5回の結果は互いに独立とは言いがたい。
+
+本実習では、得られた結果に対して\textbf{どこまで言えてどこから言えないのか}を
+区別して書けるようになることを重視する。
+\end{itembox}
+
+\begin{screen}
+\textbf{課題1b-3} \quad 集約関数と正規化の有無の6通りについて、
+Coraの頂点分類の精度をseed 5通りで測定し、
+対応のある比較で最良の設定と他の設定を判定せよ。
+\end{screen}
+
+\noindent
+結果は表\ref{tab:aggr}の形式でまとめること。
+
+\begin{table}[h]
+\caption{集約関数と正規化の有無による頂点分類精度(Cora、2層、seed 5通り)}
+\label{tab:aggr}
+\begin{center}
+\begin{tabular}{|l|c||p{2.4cm}|p{2.0cm}|p{1.6cm}|p{2.0cm}|}
+\hline
+集約 & 正規化 & テスト精度 (平均$\pm$標準偏差) & 訓練精度 & 勝率 & 判定 \\
+\hline\hline
+add  & あり & & & & \\
+\hline
+add  & なし & & & & \\
+\hline
+mean & あり & & & & \\
+\hline
+mean & なし & & & & \\
+\hline
+max  & あり & & & & \\
+\hline
+max  & なし & & & & \\
+\hline
+min  & あり & & & & \\
+\hline
+min  & なし & & & & \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\section{第1部の課題}
+
+課題1a-1から課題1b-5までをノートブック上で完成させ、
+\textbf{実行して得られた結果を含むipynbファイル}を提出すること。
+
+\subsection*{前半 (\texttt{gnn\_1a.ipynb})}
+
+\begin{description}
+\item[課題1a-1] 隣接行列$A$の構成
+\item[課題1a-2] 対称正規化行列$\hat{A}$の構成
+\item[課題1a-3] $H'=\hat{A}XW^{\top}+b$の手計算と \verb|GCNConv| との一致確認
+\item[課題1a-4] 「1層 = 1ホップ」の確認
+\item[課題1a-5] (記述) 次の3点に答えよ。
+  \begin{enumerate}
+  \item $\hat{A}$を作るとき、なぜ$A$ではなく$\tilde{A}=A+I$を正規化したのか。
+    $I$を足さずに正規化すると、頂点自身の特徴は出力にどう反映されるか。
+  \item $\hat{A}_{ij}=1/\sqrt{\tilde{d}_i\tilde{d}_j}$より、
+    次数の大きい頂点どうしを結ぶ辺の重みは小さくなる。
+    この設計にはどんな意図があると考えられるか。辺単位の検算結果を根拠に述べよ。
+  \item 層数を増やすと参照範囲が広がることが分かった。
+    では層数を増やせば精度は上がると予想するか。理由とともに述べよ。
+    \textbf{(第2部前半でこの予想を検証する。外れていてもよい。根拠のある予想を書くこと。)}
+  \end{enumerate}
+\end{description}
+
+\subsection*{後半 (\texttt{gnn\_1b.ipynb})}
+
+\begin{description}
+\item[課題1b-1] \verb|MyConv.message()| の実装と \verb|GCNConv| との一致確認
+\item[課題1b-2] 次数バイアスの測定
+\item[課題1b-3] 6通りの設定での精度比較と対応のある比較による判定
+\item[課題1b-4] \verb|MyConv| の \verb|aggr| に \verb|"min"| を指定して実行し、
+  結果を表\ref{tab:aggr}に加えよ。
+\item[課題1b-5] (記述) 次の3点に答えよ。
+  \begin{enumerate}
+  \item 次数との相関が最も強くなったのはどの設定か。
+    なぜそうなるのかを集約の式に基づいて説明せよ。
+    また \verb|mean| では相関の符号がどうなったか、その理由も述べよ。
+  \item どの集約が最も良かったか。その差は対応のある比較で「本物の差」と言えるか。
+    判定表を根拠に述べよ。
+  \item 仮にseedを1つだけ(例えばseed=0)で実行して比較していたら、
+    どの設定が最良だと結論していたか。実際に確かめ、
+    複数回実行して平均を取ることがなぜ必要かを論じよ。
+  \end{enumerate}
+\end{description}
+
+\newpage
+\section*{メモ}
+
+\newpage
+\part{深さの効果とベースラインの重要性}
+
+\section{層を深くすると何が起きるか (前半)}
+
+使用するノートブック: \verb|gnn_2a.ipynb|
+
+第1部前半の課題1a-4で、層を1つ重ねるごとに参照できる範囲が1ホップずつ広がることを確かめた。
+Zacharyのグラフでは3層でグラフ全体に届いていた。
+ここから出てくる自然な予想は「層を深くすれば使える情報が増えて精度が上がる」である。
+課題1a-5(3)で、この予想について自分の考えを書いてもらった。
+
+\textbf{本節では、その予想を実測で検証する。}
+
+よくある説明に「層を深くすると\textbf{過平滑化}(over-smoothing、
+すべての頂点の特徴が似た値に潰れてしまう現象)が起きるから精度が落ちる」というものがある。
+この説明が本当に正しいのかどうかも、自分の手で確かめる。
+
+\subsection{学習抜きで伝播だけを繰り返す}
+
+まず、\textbf{ニューラルネットワークの学習を一切せずに}、
+第1部前半で作った$\hat{A}$を特徴行列に何度も掛けたらどうなるかを見る。
+
+\begin{equation}
+X,\quad \hat{A}X,\quad \hat{A}^2X,\quad \hat{A}^3X,\quad \dots
+\end{equation}
+
+\noindent
+これは「重みを恒等変換に固定したGNN」に相当する。
+層を深くすることの\textbf{純粋な効果}だけを取り出して観察できる。
+
+頂点の特徴が似てきたかどうかは、
+\textbf{頂点どうしの特徴ベクトルの平均コサイン類似度}で測る。
+1に近づくほど「全頂点が同じ方向を向いた」、すなわち潰れたことを意味する。
+
+\begin{screen}
+\textbf{課題2a-1} \quad ノートブックの該当セルを埋めて平均コサイン類似度を計算する関数を完成させ、
+伝播回数$k$を$0,1,2,4,8,16,32,64$と変えたときの値を表とグラフで示せ。
+\end{screen}
+
+\noindent
+ここで早合点しないこと。
+確認できるのは「\textbf{重みを学習しなければ}過平滑化が起きる」ことだけである。
+実際のGNNは重みを学習する。次節で、学習ありの場合に何が起きるかを見る。
+
+\subsection{学習ありのGCNで層数を変える}
+
+層数$L$を変えてCoraの頂点分類を学習させ、精度を測る。
+
+\begin{itembox}[l]{原因を切り分けるための記録}
+テスト精度だけでなく、\textbf{訓練精度と訓練損失も必ず記録すること。}
+
+\begin{itemize}
+\item 訓練精度が高い(100\%近い)のにテスト精度が低い \\
+  $\Longrightarrow$ 学習はできている。\textbf{汎化に失敗}している
+\item 訓練精度も低い \\
+  $\Longrightarrow$ 訓練データにすら当てはめられていない。
+  \textbf{学習そのものがうまくいっていない}
+\end{itemize}
+
+この2つは原因も対策もまったく違う。混同してはいけない。
+
+ただし後者について、「だから原因はこれだ」と一つに決めつけないこと。
+分かるのは「学習がうまくいっていない」という事実までであり、
+なぜそうなるのかは、さらに条件を変えて確かめる必要がある。
+第\ref{sec:seedcheck}節でその確認を行う。
+\end{itembox}
+
+\begin{screen}
+\textbf{課題2a-2} \quad 層数を$2,3,4,6,8$と変えて、それぞれseed 5通りで測定し、
+表\ref{tab:depth}を完成させよ。
+\end{screen}
+
+\begin{table}[h]
+\caption{層数による頂点分類精度の変化(Cora、seed 5通り)}
+\label{tab:depth}
+\begin{center}
+\begin{tabular}{|c||p{3.0cm}|p{1.8cm}|p{1.8cm}|p{2.2cm}|}
+\hline
+層数 & テスト精度 (平均$\pm$標準偏差) & 訓練精度 & 訓練損失 & 平均cos類似度 \\
+\hline\hline
+2  & & & & \\
+\hline
+3  & & & & \\
+\hline
+4  & & & & \\
+\hline
+6  & & & & \\
+\hline
+8  & & & & \\
+\hline
+12 & & & & \\
+\hline
+16 & & & & \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\noindent
+表が完成したら、次の順序で読むこと。
+
+\begin{enumerate}
+\item \textbf{テスト精度}は層数とともにどうなったか。第1部前半の予想は当たっていたか。
+\item \textbf{訓練精度}を見る。層数が浅いうちは訓練精度はどうなっているか。
+  訓練精度が高いままテスト精度だけ落ちているなら、原因は汎化の失敗である。
+\item 最も深い設定で\textbf{訓練精度と訓練損失}はどうなったか。
+  訓練精度が落ちているなら、\textbf{訓練データにすら当てはめられていない}ということである。
+  その場合、テスト精度の低下を「汎化の問題」だけで説明することはできない。
+  ただし、そこから直ちに「原因は勾配である」と断定することもできない。
+  言えるのは「学習そのものがうまくいっていない」ところまでである。
+\item \textbf{cos類似度}の列を見る。前節では伝播のたびに単調に1へ近づいた。
+  学習ありの場合も同じように単調に増えているか。
+  もし増えていないなら、「過平滑化が進んだから精度が落ちた」という筋書きは
+  \textbf{この実験結果からは読み取れない}ことになる。
+  ただしこれは「過平滑化が起きていない」ことの証明ではない。
+  手元のデータがその説明を支持していない、というだけである。
+  実験結果から言えることと言えないことを区別すること。
+\item \textbf{標準偏差}の列を見る。層が深くなるとばらつきはどうなったか。
+  平均だけでなくばらつきの変化も、何が起きているかの手がかりになる。
+\end{enumerate}
+
+\subsection{その崩れはどれくらい確実な現象か}\label{sec:seedcheck}
+
+前節で、最も深い設定では訓練精度そのものが落ちることを観察した。
+しかしそれは、たった5通りのseedで見た結果である。
+\textbf{「深くすると訓練に失敗する」と言い切ってよいのか。}
+
+seedを10通りに増やして、8層の訓練精度が実行ごとにどうばらつくかを確かめる。
+
+\begin{screen}
+\textbf{課題2a-3} \quad 8層と6層について、seedを$0$から$9$まで変えて訓練精度を測定し、
+そのばらつきを比較せよ。
+\end{screen}
+
+\begin{itembox}[l]{ここが第2部前半で最も重要な観察である}
+8層の訓練精度は、seedによって大きく変わるはずである。
+つまり「8層にすると訓練に失敗する」のではなく、
+\textbf{「8層にすると訓練が成功したり失敗したりする」}というのが正しい記述である。
+
+前節で見た低い平均値は、失敗した回に引きずられた平均であって、
+「毎回失敗する」という意味ではない。
+
+ここで前節の\textbf{テスト精度の標準偏差}を見直してほしい。
+層数とともに標準偏差が大きくなっていたはずである。
+\textbf{あのばらつきの大きさ自体が、この不安定さの現れだった。}
+平均だけを見ていては気づけない。
+
+実験結果を報告するときは「深くすると訓練に失敗する」と断定せず、
+\textbf{「深くすると訓練が不安定になり、失敗することがある」}と書くこと。
+\end{itembox}
+
+\subsection{残差接続}
+
+第\ref{sec:seedcheck}節で、深い設定では\textbf{訓練そのものが不安定になる}ことが分かった。
+訓練データにすら当てはめられない回があるのだから、
+まず手を打つべきは「学習が安定して進むようにすること」である。
+
+その代表的な手法が\textbf{残差接続}(residual connection)である。
+これは深いネットワークで勾配が届きにくくなる問題への対策として提案されたものだが、
+\textbf{効いたからといって原因が勾配だけだったと決まるわけではない}。
+効果があったという事実と、その理由の説明は別のものである。
+
+残差接続では、各層の出力をそのまま次へ渡すのではなく、入力を足して渡す。
+
+\begin{equation}
+\bm{x}^{(l+1)} = \bm{x}^{(l)} + \mathrm{ReLU}\!\left(\mathrm{Conv}(\bm{x}^{(l)})\right)
+\end{equation}
+
+\begin{screen}
+\textbf{課題2a-4} \quad 層数$4,6,8$について残差接続の有無を比較し、
+改善の大きさと\textbf{訓練精度の変化}を記録せよ。
+\end{screen}
+
+\noindent
+改善の大きさが層数によってどう違うかを見ること。
+また、残差ありのときに訓練精度がどう変わったかに注目すること。
+第\ref{sec:seedcheck}節で見た不安定さが解消されているかが要点である。
+
+\section{グラフ分類とベースライン (後半)}
+
+使用するノートブック: \verb|gnn_2b.ipynb|
+
+ここまでは\textbf{1つの大きなグラフの中の頂点を分類する}問題を扱ってきた(頂点分類)。
+本節では問題設定を変え、
+\textbf{グラフ1つを丸ごと1個のデータとみなして分類する}(グラフ分類)。
+
+題材は\textbf{PROTEINS}データセットである。
+1113個のタンパク質をグラフとして表現したもので、
+頂点はアミノ酸の二次構造要素、辺はそれらが空間的に近いこと、
+ラベルはそのタンパク質が酵素かどうかを表す。
+
+そして本節の本題はもう一つある。
+
+\begin{center}
+\textbf{その精度は、本当にGNNがグラフ構造を理解したおかげなのか。}
+\end{center}
+
+\subsection{データを観察する}
+
+モデルを組む前に、\textbf{データそのものを見る}。
+特にグラフ分類では、「グラフの大きさ」だけでラベルが当たってしまうことがよくある。
+
+\begin{screen}
+\textbf{課題2b-1} \quad PROTEINSのクラス分布と、クラスごとの平均頂点数・平均辺数を求めよ。
+\end{screen}
+
+\subsection{ベースラインを2つ作る}
+
+\begin{description}
+\item[ベースライン1: 多数派を答えるだけ] \mbox{}\\
+何も学習せず、常に「個数の多い方のクラス」と答える。
+\textbf{どんなモデルもこれを超えられなければ価値がない}、という下限である。
+
+\item[ベースライン2: グラフの大きさだけを見る決定木] \mbox{}\\
+\textbf{グラフの構造をいっさい見ず}、頂点数と辺数という2つの数だけから分類する決定木。
+GNNが「グラフ構造を理解した」と主張するなら、\textbf{最低でもこれを超えなければならない}。
+\end{description}
+
+\begin{itembox}[l]{公正な比較のために}
+ベースラインとGNNを比べるときは、\textbf{まったく同じ訓練/テスト分割}を使わなければならない。
+分割が違えば、差が手法の差なのか分割の差なのか分からなくなる。
+
+同じ分割を使えば、第1部前半の「実験結果の比較のしかた」の節で述べた\textbf{対応のある比較}が使える。
+seedごとに1対1で差を取り、
+(1)全勝したか、(2)差の平均が標準誤差の2倍を超えるか、で判定する。
+\end{itembox}
+
+\begin{screen}
+\textbf{課題2b-2} \quad ノートブックの該当セルを埋めて2つのベースラインを完成させ、
+seed 5通りでの精度を求めよ。
+\end{screen}
+
+\subsection{読み出し(プーリング)}
+
+頂点分類では、各頂点の特徴ベクトルをそのまま分類に使えた。
+グラフ分類では\textbf{グラフ1個につき1本のベクトル}が必要である。
+そこで畳み込みを終えたあと、グラフ内の全頂点の特徴を1本にまとめる。
+これを\textbf{読み出し}(readout)またはプーリングと呼ぶ。
+
+\begin{center}
+\begin{tabular}{|l|l|p{6.5cm}|}
+\hline
+関数 & 計算 & 性質 \\
+\hline\hline
+\verb|global_add_pool|  & 全頂点の\textbf{和}   & 頂点数に比例してスケールが変わる \\
+\hline
+\verb|global_mean_pool| & 全頂点の\textbf{平均} & 頂点数によるスケールの違いが打ち消される \\
+\hline
+\verb|global_max_pool|  & 各次元の\textbf{最大} & 「際立った頂点があるか」を拾う \\
+\hline
+\end{tabular}
+\end{center}
+
+\noindent
+課題2b-1で、このデータはクラスによってグラフの大きさが違うことを確認したはずである。
+\textbf{どの読み出しが有利になるか、実験の前に予想を立てること。}
+
+なお「平均を取ればグラフの大きさの情報が完全に消える」わけではない。
+消えるのは\textbf{足し合わせによるスケールの違い}である。
+畳み込みを通った後の各頂点の特徴には、
+その頂点の周囲がどれだけ混み合っているかが反映されうるので、
+大きさに関する手がかりが平均後も残ることはある。
+「何が消えて何が残るのか」を区別して考えること。
+
+\subsection{畳み込みレイヤの比較}
+
+比較する3つのレイヤの違いは、
+\textbf{隣人の情報と自分自身の情報をどう扱うか}にある。
+
+\begin{description}
+\item[\texttt{GCNConv}] 自分と隣人を区別せず、次数で正規化して平均的に混ぜる
+\begin{equation}
+\bm{x}'_i=\sum_{j\in\mathcal{N}(i)\cup\{i\}}\frac{1}{\sqrt{\tilde{d}_i\tilde{d}_j}}W\bm{x}_j
+\end{equation}
+
+\item[\texttt{GraphConv}] 自分と隣人に\textbf{別々の重み}を与え、正規化せずに足す
+\begin{equation}
+\bm{x}'_i=W_1\bm{x}_i+W_2\sum_{j\in\mathcal{N}(i)}\bm{x}_j
+\end{equation}
+
+\item[\texttt{GINConv}] 隣人を\textbf{和}で集約したあとMLPを通す。
+理論上、グラフを区別する能力が3つの中で最も高いことが知られている
+\begin{equation}
+\bm{x}'_i=\mathrm{MLP}\Big((1+\epsilon)\bm{x}_i+\sum_{j\in\mathcal{N}(i)}\bm{x}_j\Big)
+\end{equation}
+\end{description}
+
+\noindent
+3つの式の違いを、次の点に注目して読むこと。
+
+\begin{itemize}
+\item \verb|GCNConv| は正規化によって\textbf{次数による大きさの違いを抑えている}。
+  次数の情報が消えるわけではない(正規化係数そのものが次数から作られている)。
+  抑えられるのは「隣人が多いほど値が大きくなる」というスケールの偏りである。
+\item \verb|GraphConv| は正規化を行わず、自分と隣人に別々の重みを与える。
+\item \verb|GINConv| は和で集約したあとMLPを通す。
+\end{itemize}
+
+\begin{itembox}[l]{式の前提}
+上の3式は要点を見やすくするため簡略化してある。
+実際の \verb|GCNConv| と \verb|GraphConv| は既定でバイアス項を持つが、式では省略した。
+また \verb|GINConv| の $\epsilon$ は既定で $0$ に固定されており、
+本実習でも学習させずに $\epsilon=0$ のまま用いる。
+\end{itembox}
+
+\begin{screen}
+\textbf{課題2b-3} \quad 3つのレイヤと3つの読み出しの9通りの組み合わせについて、
+seed 5通りで精度を測定し、表\ref{tab:graph}を完成させよ。
+各欄には、ベースライン2(決定木)を上回ったかどうかも記すこと。
+\end{screen}
+
+\begin{table}[h]
+\caption{レイヤと読み出しによるグラフ分類精度(PROTEINS、3層、seed 5通り)}
+\label{tab:graph}
+\begin{center}
+\begin{tabular}{|l||p{3.0cm}|p{3.0cm}|p{3.0cm}|}
+\hline
+\multirow{2}{*}{レイヤ} & \multicolumn{3}{c|}{読み出し} \\
+\cline{2-4}
+ & \multicolumn{1}{c|}{mean} & \multicolumn{1}{c|}{add} & \multicolumn{1}{c|}{max} \\
+\hline\hline
+\verb|GCNConv|   & & & \\
+\hline
+\verb|GraphConv| & & & \\
+\hline
+\verb|GINConv|   & & & \\
+\hline
+\hline
+\multicolumn{4}{|l|}{ベースライン1 (多数派): \hspace{3cm} ベースライン2 (決定木): } \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{選んだ最良の組み合わせを、別のseedで確かめる}
+
+課題2b-3では、9通りの中から最も平均精度の高い組み合わせを選び、
+\textbf{その選ぶのに使ったのと同じ5つの分割}で決定木と比較した。
+
+\begin{itembox}[l]{ここに落とし穴がある}
+9通りを試して最も良かったものを選んだのだから、その組み合わせは
+\textbf{たまたまその5つの分割に合っていただけ}かもしれない。
+候補をたくさん試せば、偶然よく当たるものが1つくらいは出てくる。
+選ぶのに使った分割で、選んだものを評価すれば、成績は良く出て当たり前である。
+
+これを避ける標準的な方法は、
+\textbf{選ぶための分割と、確かめるための分割を分ける}ことである。
+
+\begin{itemize}
+\item seed $0$〜$4$ \dots 9通りから最良を\textbf{選ぶ}ために使った(課題2b-3)
+\item seed $5$〜$9$ \dots 選んだ1つを\textbf{確かめる}ために使う(課題2b-4。ここで初めて使う)
+\end{itemize}
+\end{itembox}
+
+\begin{screen}
+\textbf{課題2b-4} \quad 課題2b-3で選んだ組み合わせが、
+選択に使っていないseed $5$〜$9$でも決定木を上回るかを確かめよ。
+\end{screen}
+
+\noindent
+確認用のseedでも決定木を上回ったなら、課題2b-3の結論は補強される。
+上回らなかった、あるいは差が小さくなったなら、
+課題2b-3の結果には\textbf{選び方による下駄が履かされていた}ということである。
+どちらの結果になっても、そのまま正直に報告すること。
+
+なお、これでもまだ十分ではない。
+確認用の5分割も同じPROTEINSから作ったもので、訓練集合どうしは大きく重なっている。
+本当に一般的な優位性を主張するには、別のデータセットでの検証や、
+比較対象と仮説を\textbf{測定する前に}決めておくことが必要になる。
+
+\section{第2部の課題}
+
+課題2a-1から課題2b-5までをノートブック上で完成させ、
+\textbf{実行して得られた結果を含むipynbファイル}を提出すること。
+
+\subsection*{前半 (\texttt{gnn\_2a.ipynb})}
+
+\begin{description}
+\item[課題2a-1] 平均コサイン類似度の実装と、学習なしの伝播における過平滑化の観測
+\item[課題2a-2] 層数$2,3,4,6,8$での測定
+\item[課題2a-3] 8層の結果がseedにどれだけ依存するかの確認
+\item[課題2a-4] 残差接続の効果の測定
+\item[課題2a-5] 層数12と16でも測定し、表\ref{tab:depth}を完成させよ。残差の有無の両方で行うこと。
+\item[課題2a-6] (記述) 次の6点に答えよ。
+  \begin{enumerate}
+  \item テスト精度は層数とともにどう変化したか。
+    第1部前半の課題1a-5(3)で書いた予想は当たっていたか。
+  \item 訓練精度の列から何が読み取れるか。浅い層と深い層で何が違うか。
+    「汎化の失敗」と「訓練そのものの失敗」という言葉を使って説明せよ。
+  \item cos類似度は層数とともに単調に増えたか。
+    「過平滑化のせいで精度が落ちた」という説明は、あなたの実験結果から読み取れるか。
+    読み取れない場合、それは「過平滑化が起きていない」ことの証明になるかも述べよ。
+    学習なしの伝播との違いにも触れること。
+  \item 課題2a-3でseedを10通りに増やした結果、8層について何が分かったか。
+    5通りだけを見て書いたであろう結論と、どこが変わったか。
+  \item 残差接続はどの層数で最も効果が大きかったか。訓練精度の変化を根拠に述べよ。
+    また、残差接続が効いたことから「原因は勾配が届かないことだった」と
+    結論してよいか。理由とともに述べよ。
+  \item 以上を踏まえて、「GNNの層数は何層にすべきか」という問いに、
+    あなたの実験結果に基づいて答えよ。単一の数値ではなく、条件付きで答えてよい。
+  \end{enumerate}
+\end{description}
+
+\subsection*{後半 (\texttt{gnn\_2b.ipynb})}
+
+\begin{description}
+\item[課題2b-1] PROTEINSのクラス分布とグラフの大きさの観察
+\item[課題2b-2] 2つのベースラインの実装
+\item[課題2b-3] 9通りの組み合わせの比較(表\ref{tab:graph}の完成)
+\item[課題2b-4] 選択に使っていないseedでの確認
+\item[課題2b-5] 最良の組み合わせについて、畳み込みの層数を$2,3,4,5$と変えて測定せよ。
+  第2部前半で頂点分類について観察したことと同じ傾向が見られるか。
+\end{description}
+
+\subsection*{追加課題}
+
+ここまでの課題は、\textbf{測定して記録する}ことが中心であった。
+次の2問は、\textbf{測定した結果から何がどこまで言えるのか}を問うものである。
+手を動かす必要はない。これまでに得た数値を根拠に、自分の言葉で述べよ。
+
+\begin{description}
+\item[課題2b-6] 選択に使った seed 0--4 での差と、選択に使っていない seed 5--9 での差を比較せよ。
+  (1) 2つの差はどう違ったか。違いが小さかった場合、それは「選択の影響がなかった」ことの
+  証明になるか。
+  (2) 「この組み合わせは決定木より優れている」と主張するには、
+  ここまでの結果に加えてあと何が必要か。
+
+\item[課題2b-7] 本実習では第1部後半以降、すべての精度を5回以上の平均と標準偏差で報告し、
+  対応のある比較で判定してきた。
+  (1) もし1回だけの実行で比較していたら、どの結論が変わっていた可能性があるか。
+  自分の測定結果から具体例を1つ挙げて述べよ。
+  (2) 自分の研究で手法を比較するとき、今日の進め方のうちどれを持ち帰れるか。
+  1つ挙げて理由を述べよ。
+\end{description}
+
+\begin{thebibliography}{9}
+\bibitem{murata2022}
+村田 剛志.
+\newblock グラフニューラルネットワーク.
+\newblock オーム社, 2022.
+
+\bibitem{sato2024}
+佐藤 竜馬.
+\newblock グラフニューラルネットワーク.
+\newblock 講談社, 2024.
+
+\bibitem{murata2019}
+村田 剛志.
+\newblock Pythonで学ぶネットワーク分析.
+\newblock オーム社, 2019.
+
+\bibitem{ikeda2019}
+池田 裕一, 井上 寛廉, 谷澤 俊弘.
+\newblock ネットワーク科学.
+\newblock 共立出版, 2019.
+
+\bibitem{pyg}
+PyTorch Geometric ドキュメント.
+\newblock \url{https://pytorch-geometric.readthedocs.io/}
+
+\bibitem{tudataset}
+TUDataset: A collection of benchmark datasets for learning with graphs.
+\newblock \url{https://chrsmrrs.github.io/datasets/}
+\end{thebibliography}
+
+\newpage
+\section*{メモ}
+
+\end{document}
